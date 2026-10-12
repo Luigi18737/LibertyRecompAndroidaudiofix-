@@ -18,12 +18,22 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Tools & Compile Natively
+      - name: Install System Tools and Vcpkg Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake ninja-build build-essential tar curl zip unzip pkg-config
+          
+          # Clonar e inicializar vcpkg de forma nativa en el servidor
+          git clone https://github.com $HOME/vcpkg
+          $HOME/vcpkg/bootstrap-vcpkg.sh
+
+      - name: Compile Project via CMake using Vcpkg
+        run: |
           mkdir build && cd build
-          cmake .. -DLIBERTY_RECOMP_PLATFORM=ANDROID
+          cmake .. \
+            -DLIBERTY_RECOMP_PLATFORM=ANDROID \
+            -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_ROOT=$HOME/vcpkg
           make -j$(nproc)
 
       - name: Upload APK Artifact
