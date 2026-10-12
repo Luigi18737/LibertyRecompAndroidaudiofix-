@@ -18,17 +18,12 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK and Accept Licenses
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 11.0
-          log-accepted-licenses: true
-
-      - name: Auto Accept Standard Android Licenses
+      - name: Install Android NDK and Accept Licenses
         run: |
-          mkdir -p ${{ gitea.workspace || github.workspace }}/../android-sdk/licenses
-          echo -e "\n893547d6f085cd4d73504a4d4564a65b46163176\nd56f5187479451e44bc2d2502414fd3d04342837\n24333f8a63b6825ea9c5514f83d2829b004d1fee" > ${{ gitea.workspace || github.workspace }}/../android-sdk/licenses/android-sdk-license
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > ${{ gitea.workspace || github.workspace }}/../android-sdk/licenses/android-sdk-preview-license
+          mkdir -p $ANDROID_HOME/licenses
+          echo -e "\n893547d6f085cd4d73504a4d4564a65b46163176\nd56f5187479451e44bc2d2502414fd3d04342837\n24333f8a63b6825ea9c5514f83d2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/android-sdk-preview-license
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --update
 
       - name: Build C++ and APK via Gradle
         run: |
