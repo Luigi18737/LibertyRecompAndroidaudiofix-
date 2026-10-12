@@ -1,43 +1,85 @@
-name: Build Android APK
+name: Build Android APK (Ultra-Robust Edition)
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build APK
+    name: Build Native Mobile Package
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          fetch-depth: 1
 
-      - name: Set up JDK
+      - name: Safe Submodule Sync with Retry Loop
+        run: |
+          git submodule init
+          # Bucle de reintento para evitar caídas de servidores externos (como Google Source 503)
+          for i in {1..5}; do 
+            git submodule update --recursive --depth 1 && break || sleep 15; 
+          done
+
+      - name: Initialize Java Enterprise Environment
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: 'microsoft'
           java-version: '17'
 
-      - name: Install System Tools and Vcpkg Dependencies
+      - name: Hard-Coded Android SDK & NDK Setup
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build build-essential tar curl zip unzip pkg-config
           
-          # Clonar e inicializar vcpkg de forma nativa en el servidor
-          git clone https://github.com $HOME/vcpkg
-          $HOME/vcpkg/bootstrap-vcpkg.sh
+          # Forzar la instalación manual del NDK r26b (Ideal para ReXGlue/LibertyRecomp)
+          mkdir -p $HOME/android-ndk
+          curl -L https://google.com -o ndk.zip
+          unzip -q ndk.zip -d $HOME/android-ndk
+          rm ndk.zip
+          
+          # Inyectar la aceptación absoluta de licencias de Google de forma triple
+          mkdir -p $ANDROID_HOME/licenses
+          echo -e "\n893547d6f085cd4d73504a4d4564a65b46163176\nd56f5187479451e44bc2d2502414fd3d04342837\n24333f8a63b6825ea9c5514f83d2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/android-sdk-preview-license
 
-      - name: Compile Project via CMake using Vcpkg
+      - name: Bootstrap and Build Vcpkg Environment
         run: |
-          mkdir build && cd build
+          git clone https://github.com $HOME/vcpkg
+          cd $HOME/vcpkg
+          ./bootstrap-vcpkg.sh
+          # Establecer variables globales del sistema
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk/android-ndk-r26b" >> $GITHUB_ENV
+
+      - name: Ultimate Native Compilation Loop
+        run: |
+          mkdir -p build && cd build
           cmake .. \
+            -G "Ninja" \
             -DLIBERTY_RECOMP_PLATFORM=ANDROID \
             -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_ROOT=$HOME/vcpkg
-          make -j$(nproc)
+            -DVCPKG_ROOT=$HOME/vcpkg \
+            -DANDROID_NDK=$HOME/android-ndk/android-ndk-r26b \
+            -DCMAKE_BUILD_TYPE=Release
+          ninja
 
-      - name: Upload APK Artifact
+      - name: Extract and Pack Android Package Binary
+        run: |
+          # Si el repositorio genera la APK mediante Gradle tras compilar el C++, lo ejecutamos de forma aislada aquí:
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleRelease
+          elif [ -f "../LibertyRecomp/gradlew" ]; then
+            cd ../LibertyRecomp
+            chmod +x ./gradlew
+            ./gradlew assembleRelease
+          fi
+
+      - name: Publish Finished Game Package (Artifacts)
         uses: actions/upload-artifact@v4
         with:
-          name: LibertyRecomp-AudioFixed
-          path: build/*.apk
+          name: LibertyRecomp-GTA4-AudioFixed
+          path: |
+            build/*.apk
+            **/build/outputs/apk/release/*.apk
+            **/build/outputs/apk/debug/*.apk
