@@ -11,13 +11,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          submodules: false # Lo desactivamos aquí para manejarlo manualmente abajo
 
       - name: Safe Submodule Sync with Retry Loop
         run: |
           git submodule init
-          # Bucle de reintento para evitar caídas de servidores externos (como Google Source 503)
+          # Reintenta hasta 5 veces si el servidor de Google Source se cae (Error 503)
           for i in {1..5}; do 
-            git submodule update --recursive --depth 1 && break || sleep 15; 
+            git submodule update --recursive --depth 1 && break || (echo "Fallo de red, reintentando en 15s..." && sleep 15); 
           done
 
       - name: Initialize Java Enterprise Environment
@@ -31,13 +32,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build build-essential tar curl zip unzip pkg-config
           
-          # Forzar la instalación manual del NDK r26b (Ideal para ReXGlue/LibertyRecomp)
+          # Descarga oficial del NDK r26b sin corrupción
           mkdir -p $HOME/android-ndk
           curl -L https://google.com -o ndk.zip
           unzip -q ndk.zip -d $HOME/android-ndk
           rm ndk.zip
           
-          # Inyectar la aceptación absoluta de licencias de Google de forma triple
+          # Inyección forzada de licencias de Google
           mkdir -p $ANDROID_HOME/licenses
           echo -e "\n893547d6f085cd4d73504a4d4564a65b46163176\nd56f5187479451e44bc2d2502414fd3d04342837\n24333f8a63b6825ea9c5514f83d2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
           echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/android-sdk-preview-license
@@ -47,7 +48,6 @@ jobs:
           git clone https://github.com $HOME/vcpkg
           cd $HOME/vcpkg
           ./bootstrap-vcpkg.sh
-          # Establecer variables globales del sistema
           echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$HOME/android-ndk/android-ndk-r26b" >> $GITHUB_ENV
 
@@ -65,7 +65,6 @@ jobs:
 
       - name: Extract and Pack Android Package Binary
         run: |
-          # Si el repositorio genera la APK mediante Gradle tras compilar el C++, lo ejecutamos de forma aislada aquí:
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
             ./gradlew assembleRelease
