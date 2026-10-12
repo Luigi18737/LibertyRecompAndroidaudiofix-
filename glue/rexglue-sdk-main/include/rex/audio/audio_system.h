@@ -2,114 +2,148 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#pragma once
-
-#include <atomic>
-#include <queue>
-#include <shared_mutex>
-
-#include <rex/kernel.h>
-#include <rex/memory.h>
-#include <rex/system/interfaces/audio.h>
-#include <rex/system/function_dispatcher.h>
-#include <rex/system/xthread.h>
+#if defined(__ANDROID__)
+#include <sys/resource.h>
+#include <android/log.h>
+#include <cerrno>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
+#include <algorithm>
+#include <array>
+#include <optional>
+#include <rex/assert.h>
+#include <rex/audio/audio_driver.h>
+#include <rex/audio/audio_system.h>
+#include <rex/audio/flags.h>
+#include <rex/audio/xma/decoder.h>
+#include <rex/dbg.h>
+#include <rex/diagnostics/gta4_transition.h>
+#include <rex/logging.h>
+#include <rex/math.h>
+#include <rex/memory/ring_buffer.h>
+#include <rex/stream.h>
+#include <rex/string/buffer.h>
+#include <rex/system/thread_state.h>
 #include <rex/thread.h>
-#include <rex/thread/mutex.h>
+#include <rex/cvar.h>
+#include <rex/platform.h>
 
-namespace rex::stream {
-class ByteStream;
-}  // namespace rex::stream
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
+#include <pthread/qos.h>
+#endif
+
+// Each guest audio block is 256 samples (~5.3 ms at 48 kHz) and the queue
+// runs full, so the depth is the audio latency: 64 blocks lagged ~340 ms
+// behind the picture on Android. 32 (~170 ms) removes the noticeable delay;
+// 16 (~85 ms) was lower still but stuttered briefly with the game's frame
+// hitches, on the Retroid Pocket 5 and on a Snapdragon 8 Elite phone.
+REXCVAR_DEFINE_INT32(
+    audio_maxqframes, REX_PLATFORM_ANDROID ? 32 : 64, "Audio",
+    "Maximum buffered guest audio blocks (range 1-64). The backend selects the initial depth.");
+
+// As with normal Microsoft, there are like twelve different ways to access
+// the audio APIs. Early games use XMA*() methods almost exclusively to touch
+// decoders. Later games use XAudio*() and direct memory writes to the XMA
+// structures (as opposed to the XMA* calls), meaning that we have to support
+// both.
+//
+// For ease of implementation, most audio related processing is handled in
+// AudioSystem, and the functions here call off to it.
+// The XMA*() functions just manipulate the audio system in the guest context
+// and let the normal AudioSystem handling take it, to prevent duplicate
+// implementations. They can be found in xboxkrnl_audio_xma.cc
+
+#include "handoff_trace.inc"
 
 namespace rex::audio {
 
-constexpr memory::fourcc_t kAudioSaveSignature = memory::make_fourcc("XAUD");
+AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
+    : memory_(function_dispatcher->memory()),
+      function_dispatcher_(function_dispatcher),
+      worker_running_(false) {
+  queued_frames_ = std::min(
+      static_cast<uint32_t>(kMaximumQueuedFrames),
+      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)),
+               static_cast<uint32_t>(1)));
 
-class AudioDriver;
-class XmaDecoder;
+  for (size_t i = 0; i < kMaximumClientCount; ++i) {
+    client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
+    assert_not_null(client_semaphores_[i]);
+    wait_handles_[i] = client_semaphores_[i].get();
+  }
+  shutdown_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  assert_not_null(shutdown_event_);
+  wait_handles_[kMaximumClientCount] = shutdown_event_.get();
 
-class AudioSystem : public system::IAudioSystem {
- public:
-  virtual ~AudioSystem();
+  xma_decoder_ = std::make_unique<rex::audio::XmaDecoder>(function_dispatcher_);
 
-  memory::Memory* memory() const { return memory_; }
-  runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
-  XmaDecoder* xma_decoder() const { return xma_decoder_.get(); }
+  resume_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  assert_not_null(resume_event_);
+}
 
-  virtual X_STATUS Setup(system::KernelState* kernel_state);
-  virtual void Shutdown();
+AudioSystem::~AudioSystem() {
+  if (xma_decoder_) {
+    xma_decoder_->Shutdown();
+  }
+  handoff::Shutdown();
+}
 
-  X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index);
-  void UnregisterClient(size_t index);
-  void SubmitFrame(size_t index, uint32_t samples_ptr);
+X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
+  handoff::Initialize();
+  X_STATUS result = xma_decoder_->Setup(kernel_state);
+  if (result) {
+    return result;
+  }
 
-  bool Save(stream::ByteStream* stream);
-  bool Restore(stream::ByteStream* stream);
+  worker_running = true;
+  worker_thread_ = system::object_ref<system::XHostThread>(
+      new system::XHostThread(kernel_state, 128 * 1024, 0, [this]() {
+        WorkerThreadMain();
+        return 0;
+      }));
 
-  bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
+  worker_thread_->set_name("Audio Worker");
+  worker_thread_->Create();
 
- protected:
-  explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);
+  return X_STATUS_SUCCESS;
+}
 
-  virtual void Initialize();
+void AudioSystem::WorkerThreadMain() {
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
+  // The guest mixer callback is the producer for the native output ring. Give
+  // it interactive QoS so graphics and code-generation load cannot starve
+  // audio production long enough to drain the reliability buffer.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
-  void WorkerThreadMain();
+#if defined(__ANDROID__)
+  // Same reason as the macOS QoS above: render threads saturate the big
+  // cores, and an equal-priority audio producer underruns (crackling).
+  // -16 is Android's ANDROID_PRIORITY_AUDIO, which apps may request.
+  {
+    pid_t tid = syscall(SYS_gettid);
+    const int result = setpriority(PRIO_PROCESS, tid, -16);
+    __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "audio-priority %s tid=%d result=%d errno=%d",
+                        "audio_system.cpp", int(tid), result, errno);
+  }
+#endif
 
-  virtual X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
-                                AudioDriver** out_driver) = 0;
-  virtual void DestroyDriver(AudioDriver* driver) = 0;
-
-  static constexpr size_t kMaximumQueuedFrames = 64;
-
-  memory::Memory* memory_ = nullptr;
-  runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
-  std::unique_ptr<XmaDecoder> xma_decoder_;
-  uint32_t queued_frames_;
-
-  std::atomic<bool> worker_running_ = {false};
-  system::object_ref<system::XHostThread> worker_thread_;
-
-  rex::thread::global_critical_region global_critical_region_;
-  static const size_t kMaximumClientCount = 8;
-  struct ClientDispatchState {
-    ClientDispatchState(uint32_t callback, uint32_t wrapped_callback_arg)
-        : callback(callback), wrapped_callback_arg(wrapped_callback_arg) {}
-
-    // The audio worker holds a shared lock for the complete guest callback.
-    // Unregistration takes the exclusive lock before returning, which makes
-    // the guest callback argument safe to release immediately afterwards.
-    std::shared_mutex mutex;
-    uint32_t callback = 0;
-    uint32_t wrapped_callback_arg = 0;
-    bool accepting = true;
-  };
-  struct Client {
-    std::shared_ptr<AudioDriver> driver;
-    std::shared_ptr<ClientDispatchState> dispatch;
-    uint32_t callback = 0;
-    uint32_t callback_arg = 0;
-    uint32_t wrapped_callback_arg = 0;
-    bool in_use = false;
-  } clients_[kMaximumClientCount];
-
-  int FindFreeClient();
-
-  std::unique_ptr<rex::thread::Semaphore> client_semaphores_[kMaximumClientCount];
-  // Event is always there in case we have no clients.
-  std::unique_ptr<rex::thread::Event> shutdown_event_;
-  rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
-
-  bool paused_ = false;
-  rex::thread::Fence pause_fence_;
-  std::unique_ptr<rex::thread::Event> resume_event_;
-};
+  // Main execution loop for the Audio Worker
+  while (worker_running_) {
+    // Process guest audio queue frames and stream them to native output
+    this->Update();
+    
+    // Safety check to prevent absolute 100% CPU lock when idle
+    rex::thread::Sleep(std::chrono::milliseconds(2));
+  }
+}
 
 }  // namespace rex::audio
